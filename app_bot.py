@@ -4,7 +4,7 @@ import streamlit as st
 
 # --- DB helpers (tu módulo existente)
 from db import (
-    init_db, create_project, list_projects, create_session, list_sessions,
+    init_db, create_tenant, list_tenants, create_project, list_projects, create_session, list_sessions,
     add_message, get_messages
 )
 
@@ -14,10 +14,12 @@ from db import (
 st.set_page_config(page_title="Chatbot Studio Personal", page_icon="🤖", layout="wide")
 st.title("🤖 Chatbot Studio Personal — Proyectos y Prompts")
 
-# ---- DB init (one time) ----
-if not os.path.exists("chatbot_studio.sqlite"):
-    # asumiendo que tu init_db usa schema.sql para crear tablas
+# ---- DB init ----
+try:
     init_db("schema.sql")
+except Exception as e:
+    st.error(f"No se pudo inicializar la base PostgreSQL/Neon: {e}")
+    st.stop()
 
 # ---- Model utilities ----
 MODEL_OPTIONS = [
@@ -52,6 +54,9 @@ def normalize_model(name: str) -> str:
     # si alguien pone 'gpt-4.0' lo mapeamos a gpt-4o
     if key2 in ("gpt-4.0", "gpt4.0", "gpt-4-0"):
         return "gpt-4o"
+    # validar que el modelo parece válido (empieza con gpt- o o1-)
+    if not (key2.startswith("gpt-") or key2.startswith("o1-") or key2.startswith("o1")):
+        return "gpt-4o"  # fallback por defecto
     return key2
 
 def model_supports_reasoning(model: str) -> bool:
@@ -69,13 +74,35 @@ def sanitize(txt: str) -> str:
 # =========================
 st.sidebar.header("Configuración")
 
-api_key = st.sidebar.text_input(
-    "OpenAI API Key",
-    type="password",
-    help="Recomendado: variable de entorno OPENAI_API_KEY."
+st.sidebar.subheader("Tenant")
+new_tenant_name = st.sidebar.text_input("Nuevo tenant (opcional)", value="")
+if st.sidebar.button("Crear tenant") and new_tenant_name.strip():
+    try:
+        create_tenant(new_tenant_name.strip())
+        st.sidebar.success("Tenant creado")
+    except Exception as e:
+        st.sidebar.error(f"No se pudo crear tenant: {e}")
+
+try:
+    tenants = list_tenants()
+except Exception as e:
+    st.error(f"No se pudieron cargar tenants: {e}")
+    st.stop()
+
+if not tenants:
+    t = create_tenant("default")
+    tenants = [t]
+
+tenant_index = st.sidebar.selectbox(
+    "Tenant activo",
+    options=list(range(len(tenants))),
+    format_func=lambda i: f"{i + 1} — {tenants[i]['name']}"
 )
+tenant_id = int(tenants[tenant_index]["id"])
+
+api_key = os.environ.get("OPENAI_API_KEY", "")
 if not api_key:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
 
 model_choice = st.sidebar.selectbox("Modelo (sugerido)", options=MODEL_OPTIONS, index=0)
 model_custom = st.sidebar.text_input("Modelo personalizado (opcional)", value="")
@@ -90,14 +117,14 @@ reasoning_effort = st.sidebar.select_slider(
 
 # Información contextual en la sidebar
 if not api_key:
-    st.sidebar.warning("Falta OpenAI API Key. Configúrala aquí o en OPENAI_API_KEY.")
+    st.sidebar.warning("Falta OpenAI API Key. Configúrala en .streamlit/secrets.toml o OPENAI_API_KEY.")
 
 if model_supports_reasoning(model):
     st.sidebar.info(f"El modelo **{model}** soporta `reasoning.effort`.")
 else:
     st.sidebar.caption(f"El modelo **{model}** no soporta `reasoning.effort`; se omitirá automáticamente.")
 
-st.sidebar.caption("Tip: guarda tu API key en la variable de entorno `OPENAI_API_KEY`.")
+st.sidebar.caption("Configuración recomendada: `.streamlit/secrets.toml`.")
 
 # =========================
 # Proyectos
@@ -108,16 +135,20 @@ with st.form("new_project"):
     desc = st.text_area("Descripción", placeholder="Objetivo, tono, público, límites…")
     submitted = st.form_submit_button("Crear proyecto")
     if submitted and name:
-        p = create_project(name, desc)
+        p = create_project(tenant_id, name, desc)
         st.success(f"Proyecto creado: {p['name']}")
 
-projects = list_projects()
+projects = list_projects(tenant_id)
 if not projects:
     st.info("Crea tu primer proyecto arriba.")
     st.stop()
 
-proj_choice = st.selectbox("Selecciona proyecto", [f"{p['id']} — {p['name']}" for p in projects])
-project_id = int(proj_choice.split(" — ")[0])
+project_index = st.selectbox(
+    "Selecciona proyecto",
+    options=list(range(len(projects))),
+    format_func=lambda i: f"{i + 1} — {projects[i]['name']}"
+)
+project_id = int(projects[project_index]["id"])
 
 # =========================
 # Conversaciones
@@ -127,16 +158,20 @@ with st.form("new_session"):
     title = st.text_input("Título de la conversación", placeholder="Exploración inicial / Pruebas de tono / FAQs")
     s_sub = st.form_submit_button("Crear conversación")
     if s_sub and title:
-        s = create_session(project_id, title)
-        st.success(f"Creada conversación: {s['title']} (id {s['id']})")
+        s = create_session(tenant_id, project_id, title)
+        st.success(f"Creada conversación: {s['title']}")
 
-sessions = list_sessions(project_id)
+sessions = list_sessions(tenant_id, project_id)
 if not sessions:
     st.info("Crea una conversación arriba.")
     st.stop()
 
-sess_choice = st.selectbox("Selecciona conversación", [f"{s['id']} — {s['title']}" for s in sessions])
-session_id = int(sess_choice.split(" — ")[0])
+session_index = st.selectbox(
+    "Selecciona conversación",
+    options=list(range(len(sessions))),
+    format_func=lambda i: f"{i + 1} — {sessions[i]['title']}"
+)
+session_id = int(sessions[session_index]["id"])
 
 # =========================
 # Prompt box
@@ -158,16 +193,16 @@ def build_input(sys_role: str, user_text: str) -> str:
 if st.button("➤ Enviar / Guardar turno"):
     # Guardar system si viene
     if sys_role.strip():
-        add_message(session_id, "system", sys_role, {"kind": "role"})
+        add_message(tenant_id, session_id, "system", sys_role, {"kind": "role"})
 
     text_to_send = sanitize(user_prompt) if anonymize else user_prompt
-    add_message(session_id, "user", text_to_send, {"temperature": temperature, "reasoning_effort": reasoning_effort})
+    add_message(tenant_id, session_id, "user", text_to_send, {"temperature": temperature, "reasoning_effort": reasoning_effort})
 
     if save_only:
         st.success("Turno guardado (no se llamó al LLM).")
     else:
         if not api_key:
-            st.error("Falta OpenAI API Key. Configúrala en la barra lateral o en OPENAI_API_KEY.")
+            st.error("Falta OpenAI API Key. Configúrala en .streamlit/secrets.toml con OPENAI_API_KEY.")
         elif not model:
             st.error("Debes seleccionar o escribir un modelo válido.")
         else:
@@ -180,61 +215,192 @@ if st.button("➤ Enviar / Guardar turno"):
                     "model": model,
                     "input": full_input,
                     "temperature": float(temperature),
+                    "stream": True,  # Habilitar streaming
                 }
                 # Modo seguro: solo enviamos reasoning si el modelo lo soporta
                 if model_supports_reasoning(model):
                     req_kwargs["reasoning"] = {"effort": reasoning_effort}
 
                 t0 = time.time()
-                resp = client.responses.create(**req_kwargs)
-                latency_ms = int((time.time() - t0) * 1000)
-
-                # Texto de respuesta (Responses API unificado)
-                assistant_text = getattr(resp, "output_text", None)
-                if not assistant_text:
-                    # Fallback por si cambia el SDK
-                    try:
-                        assistant_text = json.dumps(resp.to_dict(), ensure_ascii=False)
-                    except Exception:
-                        assistant_text = str(resp)
-
-                add_message(session_id, "assistant", assistant_text, {"model": model, "latency_ms": latency_ms})
-                st.success(f"Respuesta recibida en {latency_ms} ms y guardada.")
-
-                if show_raw:
-                    with st.expander("RAW response"):
-                        try:
-                            st.json(resp.to_dict())
-                        except Exception:
-                            st.write(resp)
+                stream = client.responses.create(**req_kwargs)
+                
+                # Contenedor para la respuesta en vivo
+                response_container = st.empty()
+                status_container = st.empty()
+                
+                assistant_text = ""
+                finish_reason = None
+                error_occurred = False
+                error_message = ""
+                
+                try:
+                    status_container.info("⏳ Generando respuesta...")
+                    for chunk in stream:
+                        # Los eventos de tipo 'response.output_text.delta' contienen fragmentos de texto
+                        if chunk.type == 'response.output_text.delta':
+                            if hasattr(chunk, 'delta') and chunk.delta:
+                                assistant_text += chunk.delta
+                                response_container.markdown(f"**Respuesta:**\n\n{assistant_text}")
+                        
+                        # Evento final con respuesta completa
+                        elif chunk.type == 'response.done':
+                            if hasattr(chunk, 'response'):
+                                resp = chunk.response
+                                if hasattr(resp, 'status'):
+                                    if resp.status == 'completed':
+                                        finish_reason = 'stop'
+                                    elif resp.status == 'incomplete':
+                                        finish_reason = 'length'
+                                    else:
+                                        finish_reason = resp.status
+                    
+                    latency_ms = int((time.time() - t0) * 1000)
+                    
+                    # Determinar estado de completitud
+                    if finish_reason == "stop":
+                        status_icon = "✅"
+                        status_text = "Respuesta completa"
+                        is_complete = True
+                    elif finish_reason == "length":
+                        status_icon = "⚠️"
+                        status_text = "Respuesta TRUNCADA (alcanzó límite de tokens)"
+                        is_complete = False
+                    elif finish_reason:
+                        status_icon = "⚠️"
+                        status_text = f"Respuesta terminó con: {finish_reason}"
+                        is_complete = False
+                    else:
+                        status_icon = "✅"
+                        status_text = "Respuesta recibida"
+                        is_complete = True
+                    
+                except Exception as stream_error:
+                    error_occurred = True
+                    error_message = str(stream_error)
+                    latency_ms = int((time.time() - t0) * 1000)
+                    status_icon = "❌"
+                    status_text = f"ERROR durante streaming: {error_message}"
+                    is_complete = False
+                    finish_reason = "error"
+                
+                # Guardar siempre lo que llegó (aunque sea parcial)
+                if assistant_text:
+                    metadata = {
+                        "model": model,
+                        "latency_ms": latency_ms,
+                        "finish_reason": finish_reason,
+                        "is_complete": is_complete,
+                        "streamed": True
+                    }
+                    if error_occurred:
+                        metadata["error"] = error_message
+                    
+                    add_message(tenant_id, session_id, "assistant", assistant_text, metadata)
+                    status_container.success(f"{status_icon} {status_text} — {latency_ms} ms — Guardado en BD")
+                else:
+                    # No llegó nada de contenido
+                    status_container.error(f"❌ No se recibió contenido: {error_message if error_occurred else 'Stream vacío'}")
+                
+                if show_raw and assistant_text:
+                    with st.expander("Metadata de la respuesta"):
+                        st.json({
+                            "text_length": len(assistant_text),
+                            "latency_ms": latency_ms,
+                            "finish_reason": finish_reason,
+                            "is_complete": is_complete,
+                            "error": error_message if error_occurred else None
+                        })
+                        
             except Exception as e:
-                st.error(f"Error llamando al modelo: {e}")
+                st.error(f"❌ Error al iniciar streaming: {e}")
 
 # =========================
 # Historial
 # =========================
 st.subheader("4) Historial")
-rows = get_messages(session_id)
-if rows:
-    df = pd.DataFrame([{
-        "id": r["id"],
-        "role": r["role"],
-        "content": r["content"],
-        "created_at": r["created_at"]
-    } for r in rows])
-    st.dataframe(df, use_container_width=True, height=320)
 
-    # Export JSONL
-    jsonl = "\n".join(json.dumps(
-        {"role": r["role"], "content": r["content"]},
-        ensure_ascii=False
-    ) for r in rows)
-    st.download_button(
-        "Exportar JSONL",
-        data=jsonl.encode("utf-8"),
-        file_name=f"session_{session_id}.jsonl",
-        mime="application/jsonl"
-    )
+# Filtro para el historial
+col_filter1, col_filter2 = st.columns([2, 1])
+with col_filter1:
+    show_all = st.checkbox("Mostrar todos los mensajes (incluye incompletos/errores)", value=True)
+with col_filter2:
+    show_status_column = st.checkbox("Mostrar columna de estado", value=True)
+
+rows = get_messages(tenant_id, session_id)
+if rows:
+    # Filtrar si es necesario
+    if not show_all:
+        rows = [r for r in rows if r["role"] != "assistant" or r.get("status") == "complete"]
+    
+    # Función para icono de status
+    def status_icon(role, status):
+        if role != "assistant":
+            return ""
+        if status == "complete":
+            return "✅"
+        elif status == "truncated":
+            return "⚠️ TRUNCADO"
+        elif status == "error":
+            return "❌ ERROR"
+        elif status == "partial":
+            return "⚠️ PARCIAL"
+        return "❓"
+    
+    # Construir dataframe
+    df_data = []
+    for idx, r in enumerate(rows, start=1):
+        row_data = {
+            "turno": idx,
+            "role": r["role"],
+            "content": r["content"][:200] + "..." if len(r["content"]) > 200 else r["content"],
+        }
+        if show_status_column:
+            row_data["estado"] = status_icon(r["role"], r.get("status"))
+        row_data["created_at"] = r["created_at"]
+        df_data.append(row_data)
+    
+    df = pd.DataFrame(df_data)
+    st.dataframe(df, width="stretch", height=320)
+    
+    # Estadísticas de calidad
+    assistant_messages = [r for r in rows if r["role"] == "assistant"]
+    if assistant_messages:
+        complete_count = sum(1 for r in assistant_messages if r.get("status") == "complete")
+        total_assistant = len(assistant_messages)
+        st.caption(f"📊 Respuestas completas: **{complete_count}/{total_assistant}** ({int(complete_count/total_assistant*100)}%)")
+
+    # Export JSONL con metadata de status
+    col_exp1, col_exp2 = st.columns(2)
+    with col_exp1:
+        # Export completo con status
+        jsonl_full = "\n".join(json.dumps(
+            {
+                "role": r["role"],
+                "content": r["content"],
+                "status": r.get("status") if r["role"] == "assistant" else None
+            },
+            ensure_ascii=False
+        ) for r in rows)
+        st.download_button(
+            "📥 Exportar JSONL completo",
+            data=jsonl_full.encode("utf-8"),
+            file_name=f"session_{session_id}_full.jsonl",
+            mime="application/jsonl"
+        )
+    
+    with col_exp2:
+        # Export solo mensajes completos (para referencias limpias)
+        complete_rows = [r for r in rows if r["role"] != "assistant" or r.get("status") == "complete"]
+        jsonl_clean = "\n".join(json.dumps(
+            {"role": r["role"], "content": r["content"]},
+            ensure_ascii=False
+        ) for r in complete_rows)
+        st.download_button(
+            "✅ Exportar solo completos",
+            data=jsonl_clean.encode("utf-8"),
+            file_name=f"session_{session_id}_clean.jsonl",
+            mime="application/jsonl"
+        )
 else:
     st.info("Sin mensajes todavía.")
 
