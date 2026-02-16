@@ -7,7 +7,7 @@ import streamlit as st
 from db import (
     init_db, create_tenant, list_tenants, create_project, list_projects, create_session, list_sessions,
     add_message, get_messages, get_recordia_audit_log_filtered, verify_interaction_integrity,
-    set_blockchain_anchor
+    set_blockchain_anchor, get_conversation_context
 )
 from recordia_blockchain import (
     load_blockchain_config,
@@ -121,6 +121,8 @@ reasoning_effort = st.sidebar.select_slider(
     options=["low","medium","high"],
     value="medium"
 )
+use_context = st.sidebar.checkbox("Usar contexto histórico", value=True)
+context_window = st.sidebar.slider("Mensajes de contexto", min_value=4, max_value=80, value=24, step=4)
 
 # Información contextual en la sidebar
 if not api_key:
@@ -197,6 +199,35 @@ def build_input(sys_role: str, user_text: str) -> str:
         return f"SYSTEM:\n{sys_role.strip()}\n\nUSER:\n{user_text.strip()}"
     return user_text.strip()
 
+
+def get_conversation_context_text(tenant_id: int, session_id: int, limit_messages: int) -> str:
+    """Reconstruye el contexto de conversación en formato texto para el modelo."""
+    rows = get_conversation_context(tenant_id=tenant_id, session_id=session_id, limit_messages=limit_messages)
+    if not rows:
+        return ""
+
+    lines = []
+    for row in rows:
+        role = row["role"]
+        content = (row["content"] or "").strip()
+        if not content:
+            continue
+        if role == "system":
+            lines.append(f"Sistema: {content}")
+        elif role == "user":
+            lines.append(f"Usuario: {content}")
+        else:
+            lines.append(f"Asistente: {content}")
+    return "\n".join(lines)
+
+
+def build_input_with_context(tenant_id: int, session_id: int, user_prompt_text: str, limit_messages: int = 24) -> str:
+    """Construye input final para el modelo incluyendo historial + nuevo turno."""
+    context = get_conversation_context_text(tenant_id=tenant_id, session_id=session_id, limit_messages=limit_messages)
+    if context:
+        return f"{context}\nUsuario: {user_prompt_text.strip()}\nAsistente:"
+    return f"Usuario: {user_prompt_text.strip()}\nAsistente:"
+
 if st.button("➤ Enviar / Guardar turno"):
     # Guardar system si viene
     if sys_role.strip():
@@ -217,7 +248,15 @@ if st.button("➤ Enviar / Guardar turno"):
                 from openai import OpenAI
                 client = OpenAI(api_key=api_key)
 
-                full_input = build_input(sys_role, text_to_send)
+                if use_context:
+                    full_input = build_input_with_context(
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        user_prompt_text=text_to_send,
+                        limit_messages=context_window,
+                    )
+                else:
+                    full_input = build_input(sys_role, text_to_send)
                 req_kwargs = {
                     "model": model,
                     "input": full_input,

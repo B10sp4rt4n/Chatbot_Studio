@@ -382,6 +382,53 @@ def get_messages(tenant_id, session_id):
             return cur.fetchall()
 
 
+def get_conversation_context(tenant_id: int, session_id: int, limit_messages: int = 30):
+    """
+    Recupera historial de conversación para contexto del modelo.
+
+    Seguridad:
+    - Filtra estrictamente por tenant_id y session_id.
+
+    Args:
+        tenant_id: Tenant activo
+        session_id: Sesión activa
+        limit_messages: Máximo de mensajes a devolver (últimos N)
+    """
+    safe_limit = max(1, min(int(limit_messages), 200))
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content, created_at
+                FROM (
+                    SELECT
+                        actor AS role,
+                        prompt_text AS content,
+                        created_at
+                    FROM prompts
+                    WHERE tenant_id = %s AND session_id = %s
+
+                    UNION ALL
+
+                    SELECT
+                        'assistant' AS role,
+                        response_text AS content,
+                        created_at
+                    FROM responses
+                    WHERE tenant_id = %s AND session_id = %s
+                ) AS all_messages
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (tenant_id, session_id, tenant_id, session_id, safe_limit),
+            )
+            rows = cur.fetchall()
+
+    rows.reverse()
+    return rows
+
+
 # =========================
 # Recordia: Funciones forenses
 # =========================
