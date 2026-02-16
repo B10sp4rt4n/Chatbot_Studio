@@ -1,11 +1,18 @@
 import os, re, json, time
+from datetime import datetime, time as dt_time
 import pandas as pd
 import streamlit as st
 
 # --- DB helpers (tu módulo existente)
 from db import (
     init_db, create_tenant, list_tenants, create_project, list_projects, create_session, list_sessions,
-    add_message, get_messages
+    add_message, get_messages, get_recordia_audit_log_filtered, verify_interaction_integrity,
+    set_blockchain_anchor
+)
+from recordia_blockchain import (
+    load_blockchain_config,
+    is_blockchain_configured,
+    anchor_hash_in_blockchain,
 )
 
 # =========================
@@ -405,3 +412,151 @@ else:
     st.info("Sin mensajes todavía.")
 
 st.caption("Tip: Usa 'Solo guardar' para preparar prompts sin gastar tokens; luego desmarca para probarlos.")
+
+# =========================
+# Auditoría Recordia
+# =========================
+st.subheader("5) Auditoría Recordia")
+
+col_aud_1, col_aud_2, col_aud_3 = st.columns(3)
+with col_aud_1:
+    audit_project_filter = st.selectbox(
+        "Proyecto (auditoría)",
+        options=[None] + list(range(len(projects))),
+        format_func=lambda i: "Todos" if i is None else f"{i + 1} — {projects[i]['name']}",
+    )
+with col_aud_2:
+    audit_session_filter = st.selectbox(
+        "Sesión (auditoría)",
+        options=[None] + list(range(len(sessions))),
+        format_func=lambda i: "Todas" if i is None else f"{i + 1} — {sessions[i]['title']}",
+    )
+with col_aud_3:
+    audit_limit = st.slider("Máx registros", min_value=20, max_value=1000, value=200, step=20)
+
+date_range = st.date_input("Rango de fechas (opcional)", value=())
+start_at = None
+end_at = None
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_at = datetime.combine(date_range[0], dt_time.min)
+    end_at = datetime.combine(date_range[1], dt_time.max)
+
+audit_project_id = None if audit_project_filter is None else int(projects[audit_project_filter]["id"])
+audit_session_id = None if audit_session_filter is None else int(sessions[audit_session_filter]["id"])
+
+try:
+    audit_rows = get_recordia_audit_log_filtered(
+        tenant_id=tenant_id,
+        project_id=audit_project_id,
+        session_id=audit_session_id,
+        start_at=start_at,
+        end_at=end_at,
+        limit=int(audit_limit),
+    )
+except Exception as e:
+    st.error(f"No se pudo cargar auditoría Recordia: {e}")
+    audit_rows = []
+
+if audit_rows:
+    audit_df = pd.DataFrame(
+        [
+            {
+                "response_id": r["id"],
+                "project": r["project_name"],
+                "session": r["session_title"],
+                "status": r["status"],
+                "model": r["model_used"],
+                "latency_ms": r["latency_ms"],
+                "hash": r["recordia_hash"],
+                "blockchain_tx": r["blockchain_tx_hash"],
+                "network": r["blockchain_network"],
+                "anchored_at": r["anchored_at"],
+                "created_at": r["created_at"],
+            }
+            for r in audit_rows
+        ]
+    )
+    st.dataframe(audit_df, width="stretch", height=320)
+
+    # Export JSONL con hash (forense)
+    jsonl_audit = "\n".join(
+        json.dumps(
+            {
+                "tenant_id": tenant_id,
+                "project_id": r["project_id"],
+                "session_id": r["session_id"],
+                "prompt_id": r["prompt_id"],
+                "prompt": r["prompt_text"],
+                "response": r["response_text"],
+                "status": r["status"],
+                "latency_ms": r["latency_ms"],
+                "model_used": r["model_used"],
+                "recordia_hash": r["recordia_hash"],
+                "blockchain_tx_hash": r["blockchain_tx_hash"],
+                "blockchain_network": r["blockchain_network"],
+                "anchored_at": str(r["anchored_at"]) if r["anchored_at"] else None,
+                "timestamp": str(r["created_at"]),
+            },
+            ensure_ascii=False,
+        )
+        for r in audit_rows
+    )
+
+    st.download_button(
+        "📜 Exportar auditoría JSONL con hash",
+        data=jsonl_audit.encode("utf-8"),
+        file_name=f"recordia_tenant_{tenant_id}_audit.jsonl",
+        mime="application/jsonl",
+    )
+
+    st.markdown("**Verificación de integridad (por response_id)**")
+    selected_response_id = st.selectbox(
+        "Selecciona respuesta para verificar",
+        options=[int(r["id"]) for r in audit_rows],
+        format_func=lambda rid: f"Response #{rid}",
+    )
+    if st.button("🔎 Verificar integridad"):
+        try:
+            integrity = verify_interaction_integrity(tenant_id=tenant_id, response_id=int(selected_response_id))
+            if integrity.get("is_valid"):
+                st.success("Integridad válida: hash almacenado coincide con hash recalculado.")
+            else:
+                st.error(f"Integridad inválida: {integrity}")
+            st.json(integrity)
+        except Exception as e:
+            st.error(f"No se pudo verificar integridad: {e}")
+
+    st.markdown("**Anclaje blockchain (opcional)**")
+    blockchain_cfg = load_blockchain_config(st.secrets)
+    if not is_blockchain_configured(blockchain_cfg):
+        st.info(
+            "Configura `BLOCKCHAIN_PROVIDER_URL`, `BLOCKCHAIN_PRIVATE_KEY` y `BLOCKCHAIN_FROM_ADDRESS` "
+            "en `.streamlit/secrets.toml` para habilitar anclaje on-chain."
+        )
+    else:
+        anchor_target_id = st.selectbox(
+            "Respuesta para anclar en blockchain",
+            options=[int(r["id"]) for r in audit_rows],
+            key="anchor_response_id",
+            format_func=lambda rid: f"Response #{rid}",
+        )
+        if st.button("⛓️ Anclar hash en blockchain"):
+            try:
+                row = next((r for r in audit_rows if int(r["id"]) == int(anchor_target_id)), None)
+                if not row:
+                    raise ValueError("No se encontró la respuesta seleccionada.")
+                if not row["recordia_hash"]:
+                    raise ValueError("La respuesta no tiene recordia_hash.")
+
+                tx_hash = anchor_hash_in_blockchain(row["recordia_hash"], blockchain_cfg)
+                set_blockchain_anchor(
+                    tenant_id=tenant_id,
+                    response_id=int(anchor_target_id),
+                    tx_hash=tx_hash,
+                    network=blockchain_cfg.network_name,
+                )
+                st.success(f"Hash anclado correctamente. tx_hash: {tx_hash}")
+            except Exception as e:
+                st.error(f"No se pudo anclar en blockchain: {e}")
+else:
+    st.info("No hay registros de auditoría para los filtros seleccionados.")

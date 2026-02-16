@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 import tomllib
 from psycopg import connect
@@ -39,6 +40,11 @@ def generate_recordia_hash(prompt_text: str, response_text: str, metadata: dict 
     return hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
 
 
+def generate_hash(data: str) -> str:
+    """Alias simple para generar hash SHA-256 (compatibilidad API Recordia)."""
+    return hashlib.sha256((data or "").encode("utf-8")).hexdigest()
+
+
 def _read_database_url_from_secrets_file():
     secrets_path = Path(".streamlit/secrets.toml")
     if not secrets_path.exists():
@@ -72,6 +78,23 @@ def init_db(schema_path="schema.sql"):
         with conn.cursor() as cur:
             with open(schema_path, "r", encoding="utf-8") as f:
                 cur.execute(f.read())
+            cur.execute("ALTER TABLE responses ADD COLUMN IF NOT EXISTS blockchain_tx_hash TEXT")
+            cur.execute("ALTER TABLE responses ADD COLUMN IF NOT EXISTS blockchain_network TEXT")
+            cur.execute("ALTER TABLE responses ADD COLUMN IF NOT EXISTS anchored_at TIMESTAMPTZ")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_responses_recordia_hash
+                ON responses (recordia_hash)
+                WHERE recordia_hash IS NOT NULL
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_responses_blockchain_tx_hash
+                ON responses (blockchain_tx_hash)
+                WHERE blockchain_tx_hash IS NOT NULL
+                """
+            )
             cur.execute(
                 """
                 INSERT INTO tenants (name)
@@ -271,6 +294,60 @@ def add_message(tenant_id, session_id, role, content, metadata=None):
     return message_id
 
 
+def log_interaction_to_recordia(tenant_id, project_id, session_id, prompt, response, latency, model_used):
+    """
+    Registra una interacción completa en Recordia validando alcance tenant/project/session.
+
+    Flujo:
+    1) Inserta prompt de usuario
+    2) Inserta respuesta asistente (genera hash forense automáticamente)
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM sessions
+                WHERE id = %s AND tenant_id = %s AND project_id = %s
+                """,
+                (session_id, tenant_id, project_id),
+            )
+            session_row = cur.fetchone()
+            if not session_row:
+                raise ValueError("Sesión inválida para tenant/proyecto.")
+
+    add_message(tenant_id, session_id, "user", prompt, {"kind": "recordia_prompt"})
+    response_id = add_message(
+        tenant_id,
+        session_id,
+        "assistant",
+        response,
+        {
+            "model": model_used,
+            "latency_ms": latency,
+            "is_complete": True,
+            "finish_reason": "stop",
+            "source": "recordia",
+        },
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT recordia_hash
+                FROM responses
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (response_id, tenant_id),
+            )
+            row = cur.fetchone()
+            return {
+                "response_id": response_id,
+                "recordia_hash": row["recordia_hash"] if row else None,
+            }
+
+
 def get_messages(tenant_id, session_id):
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -448,3 +525,133 @@ def get_recordia_audit_log(tenant_id: int, limit: int = 100):
                 (tenant_id, limit),
             )
             return cur.fetchall()
+
+
+def get_recordia_audit_log_filtered(
+    tenant_id: int,
+    project_id: int | None = None,
+    session_id: int | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+    limit: int = 500,
+):
+    """Log de auditoría Recordia con filtros por tenant/proyecto/sesión/fecha."""
+    query = """
+        SELECT
+            r.id,
+            r.prompt_id,
+            r.session_id,
+            s.project_id,
+            p.prompt_text,
+            r.response_text,
+            r.status,
+            r.model_used,
+            r.latency_ms,
+            r.recordia_hash,
+            r.blockchain_tx_hash,
+            r.blockchain_network,
+            r.anchored_at,
+            r.created_at,
+            s.title AS session_title,
+            pr.name AS project_name
+        FROM responses r
+        JOIN prompts p ON p.id = r.prompt_id
+        JOIN sessions s ON s.id = r.session_id
+        JOIN projects pr ON pr.id = s.project_id
+        WHERE r.tenant_id = %s
+          AND p.tenant_id = %s
+          AND s.tenant_id = %s
+          AND pr.tenant_id = %s
+    """
+    params = [tenant_id, tenant_id, tenant_id, tenant_id]
+
+    if project_id is not None:
+        query += " AND s.project_id = %s"
+        params.append(project_id)
+    if session_id is not None:
+        query += " AND r.session_id = %s"
+        params.append(session_id)
+    if start_at is not None:
+        query += " AND r.created_at >= %s"
+        params.append(start_at)
+    if end_at is not None:
+        query += " AND r.created_at <= %s"
+        params.append(end_at)
+
+    query += " ORDER BY r.created_at DESC LIMIT %s"
+    params.append(limit)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+
+
+def verify_recordia_hash(tenant_id: int, project_id: int, session_id: int, recordia_hash: str) -> dict:
+    """Verifica hash bajo alcance estricto de tenant/proyecto/sesión."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    r.id,
+                    r.recordia_hash,
+                    r.status,
+                    r.model_used,
+                    r.latency_ms,
+                    p.prompt_text,
+                    r.response_text
+                FROM responses r
+                JOIN prompts p ON p.id = r.prompt_id
+                JOIN sessions s ON s.id = r.session_id
+                WHERE r.tenant_id = %s
+                  AND p.tenant_id = %s
+                  AND s.tenant_id = %s
+                  AND s.project_id = %s
+                  AND r.session_id = %s
+                  AND r.recordia_hash = %s
+                LIMIT 1
+                """,
+                (tenant_id, tenant_id, tenant_id, project_id, session_id, recordia_hash),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"valid": False, "reason": "hash_not_found_in_scope"}
+
+            recalculated = generate_recordia_hash(
+                row["prompt_text"],
+                row["response_text"],
+                {
+                    "model": row["model_used"],
+                    "latency_ms": row["latency_ms"],
+                    "status": row["status"],
+                    "timestamp": None,
+                },
+            )
+            return {
+                "valid": recalculated == row["recordia_hash"],
+                "response_id": row["id"],
+                "stored_hash": row["recordia_hash"],
+                "calculated_hash": recalculated,
+            }
+
+
+def set_blockchain_anchor(tenant_id: int, response_id: int, tx_hash: str, network: str):
+    """Guarda evidencia de anclaje blockchain en la respuesta (aislada por tenant)."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE responses
+                SET blockchain_tx_hash = %s,
+                    blockchain_network = %s,
+                    anchored_at = NOW()
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id
+                """,
+                (tx_hash, network, response_id, tenant_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("No se pudo registrar anclaje blockchain para este tenant/response_id.")
+        conn.commit()

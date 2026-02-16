@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS responses (
     latency_ms INTEGER,
     model_used TEXT,
     recordia_hash TEXT UNIQUE,
+    blockchain_tx_hash TEXT,
+    blockchain_network TEXT,
+    anchored_at TIMESTAMPTZ,
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_responses_tenant
@@ -69,3 +72,4 @@ CREATE INDEX IF NOT EXISTS idx_responses_tenant_session_created ON responses (te
 CREATE INDEX IF NOT EXISTS idx_responses_prompt_id ON responses (prompt_id);
 CREATE INDEX IF NOT EXISTS idx_responses_status ON responses (status);
 CREATE INDEX IF NOT EXISTS idx_responses_recordia_hash ON responses (recordia_hash) WHERE recordia_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_responses_blockchain_tx_hash ON responses (blockchain_tx_hash) WHERE blockchain_tx_hash IS NOT NULL;

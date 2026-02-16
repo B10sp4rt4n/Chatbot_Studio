@@ -121,3 +121,36 @@ FROM responses
 WHERE recordia_hash IS NOT NULL 
 GROUP BY tenant_id;
 ```
+
+## Webhook de verificación (FastAPI)
+
+Levanta la API para verificación externa de hashes:
+
+```bash
+uvicorn recordia_api:app --host 0.0.0.0 --port 8000
+```
+
+Endpoint principal:
+
+```bash
+POST /verify_hash
+{
+	"tenant_id": 1,
+	"project_id": 2,
+	"session_id": 3,
+	"hash": "<recordia_hash>"
+}
+```
+
+## Configuración blockchain (opcional)
+
+En `.streamlit/secrets.toml` (o variables de entorno):
+
+```toml
+BLOCKCHAIN_PROVIDER_URL = "https://sepolia.infura.io/v3/<PROJECT_ID>"
+BLOCKCHAIN_PRIVATE_KEY = "<private_key_hex>"
+BLOCKCHAIN_FROM_ADDRESS = "0x..."
+BLOCKCHAIN_NETWORK = "sepolia"
+```
+
+Con esto se habilita anclaje on-chain desde la UI de auditoría.
