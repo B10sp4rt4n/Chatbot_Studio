@@ -1,9 +1,42 @@
 import os
+import hashlib
+import json
 from pathlib import Path
 import tomllib
 from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
+
+
+# =========================
+# Recordia: Hash generation
+# =========================
+def generate_recordia_hash(prompt_text: str, response_text: str, metadata: dict = None) -> str:
+    """
+    Genera hash SHA-256 forense de la interacción completa.
+    
+    Incluye:
+    - prompt_text: Input del usuario
+    - response_text: Output del modelo
+    - metadata: model_used, latency_ms, status, timestamp
+    
+    Este hash es único e inmutable para trazabilidad Recordia.
+    """
+    # Construir payload canónico
+    payload = {
+        "prompt": prompt_text,
+        "response": response_text,
+        "model": metadata.get("model") if metadata else None,
+        "latency_ms": metadata.get("latency_ms") if metadata else None,
+        "status": metadata.get("status") if metadata else "complete",
+        "timestamp": metadata.get("timestamp") if metadata else None
+    }
+    
+    # Serializar de forma determinística (ordenado por keys)
+    canonical_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    
+    # Hash SHA-256
+    return hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
 
 
 def _read_database_url_from_secrets_file():
@@ -167,7 +200,7 @@ def add_message(tenant_id, session_id, role, content, metadata=None):
                 if not prompt_id:
                     cur.execute(
                         """
-                        SELECT id
+                        SELECT id, prompt_text
                         FROM prompts
                         WHERE tenant_id = %s AND session_id = %s
                         ORDER BY created_at DESC
@@ -179,10 +212,24 @@ def add_message(tenant_id, session_id, role, content, metadata=None):
                     if not prompt_row:
                         raise ValueError("No existe prompt previo para asociar la respuesta.")
                     prompt_id = prompt_row["id"]
+                    prompt_text = prompt_row["prompt_text"]
+                else:
+                    # Si se provee prompt_id, obtener el texto
+                    cur.execute(
+                        """
+                        SELECT prompt_text
+                        FROM prompts
+                        WHERE id = %s AND tenant_id = %s
+                        """,
+                        (prompt_id, tenant_id),
+                    )
+                    prompt_row = cur.fetchone()
+                    if not prompt_row:
+                        raise ValueError("Prompt no encontrado.")
+                    prompt_text = prompt_row["prompt_text"]
 
                 latency_ms = metadata.get("latency_ms") if isinstance(metadata, dict) else None
                 model_used = metadata.get("model") if isinstance(metadata, dict) else None
-                recordia_hash = metadata.get("recordia_hash") if isinstance(metadata, dict) else None
                 
                 # Determinar status basado en metadata
                 status = "complete"  # default
@@ -195,6 +242,15 @@ def add_message(tenant_id, session_id, role, content, metadata=None):
                             status = "error"
                         else:
                             status = "partial"
+                
+                # ===== RECORDIA: Generar hash forense de la interacción =====
+                recordia_metadata = {
+                    "model": model_used,
+                    "latency_ms": latency_ms,
+                    "status": status,
+                    "timestamp": None  # Se genera automáticamente en BD
+                }
+                recordia_hash = generate_recordia_hash(prompt_text, content, recordia_metadata)
 
                 cur.execute(
                     """
@@ -245,5 +301,150 @@ def get_messages(tenant_id, session_id):
                 ORDER BY created_at ASC
                 """,
                 (tenant_id, session_id, tenant_id, session_id),
+            )
+            return cur.fetchall()
+
+
+# =========================
+# Recordia: Funciones forenses
+# =========================
+
+def get_interaction_by_hash(recordia_hash: str):
+    """
+    Recupera una interacción completa por su hash Recordia.
+    
+    Útil para:
+    - Auditoría forense
+    - Verificación de integridad
+    - Búsqueda de interacciones específicas
+    
+    Returns: dict con prompt, response y metadata completa
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    r.id AS response_id,
+                    r.tenant_id,
+                    r.session_id,
+                    r.prompt_id,
+                    r.response_text,
+                    r.status,
+                    r.latency_ms,
+                    r.model_used,
+                    r.recordia_hash,
+                    r.created_at AS response_timestamp,
+                    p.prompt_text,
+                    p.actor AS prompt_actor,
+                    p.created_at AS prompt_timestamp,
+                    s.title AS session_title,
+                    pr.name AS project_name,
+                    t.name AS tenant_name
+                FROM responses r
+                JOIN prompts p ON r.prompt_id = p.id
+                JOIN sessions s ON r.session_id = s.id
+                JOIN projects pr ON s.project_id = pr.id
+                JOIN tenants t ON r.tenant_id = t.id
+                WHERE r.recordia_hash = %s
+                """,
+                (recordia_hash,),
+            )
+            return cur.fetchone()
+
+
+def verify_interaction_integrity(tenant_id: int, response_id: int) -> dict:
+    """
+    Verifica la integridad de una interacción recalculando su hash.
+    
+    Returns:
+        {
+            "is_valid": bool,
+            "stored_hash": str,
+            "calculated_hash": str,
+            "status": str
+        }
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    r.recordia_hash,
+                    r.response_text,
+                    r.status,
+                    r.latency_ms,
+                    r.model_used,
+                    p.prompt_text
+                FROM responses r
+                JOIN prompts p ON r.prompt_id = p.id
+                WHERE r.id = %s AND r.tenant_id = %s
+                """,
+                (response_id, tenant_id),
+            )
+            row = cur.fetchone()
+            
+            if not row or not row["recordia_hash"]:
+                return {
+                    "is_valid": False,
+                    "error": "Response not found or hash not generated"
+                }
+            
+            # Recalcular hash
+            metadata = {
+                "model": row["model_used"],
+                "latency_ms": row["latency_ms"],
+                "status": row["status"],
+                "timestamp": None
+            }
+            calculated_hash = generate_recordia_hash(
+                row["prompt_text"], 
+                row["response_text"], 
+                metadata
+            )
+            
+            return {
+                "is_valid": calculated_hash == row["recordia_hash"],
+                "stored_hash": row["recordia_hash"],
+                "calculated_hash": calculated_hash,
+                "status": row["status"]
+            }
+
+
+def get_recordia_audit_log(tenant_id: int, limit: int = 100):
+    """
+    Obtiene log de auditoría Recordia con todas las interacciones rastreables.
+    
+    Args:
+        tenant_id: ID del tenant
+        limit: Número máximo de registros (default: 100)
+    
+    Returns: Lista de interacciones con hash Recordia
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    r.id,
+                    r.recordia_hash,
+                    r.status,
+                    r.model_used,
+                    r.latency_ms,
+                    r.created_at,
+                    s.title AS session_title,
+                    pr.name AS project_name,
+                    LENGTH(p.prompt_text) AS prompt_length,
+                    LENGTH(r.response_text) AS response_length
+                FROM responses r
+                JOIN prompts p ON r.prompt_id = p.id
+                JOIN sessions s ON r.session_id = s.id
+                JOIN projects pr ON s.project_id = pr.id
+                WHERE r.tenant_id = %s 
+                  AND r.recordia_hash IS NOT NULL
+                ORDER BY r.created_at DESC
+                LIMIT %s
+                """,
+                (tenant_id, limit),
             )
             return cur.fetchall()

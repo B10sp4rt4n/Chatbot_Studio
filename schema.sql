@@ -68,3 +68,4 @@ CREATE INDEX IF NOT EXISTS idx_prompts_tenant_session_created ON prompts (tenant
 CREATE INDEX IF NOT EXISTS idx_responses_tenant_session_created ON responses (tenant_id, session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_responses_prompt_id ON responses (prompt_id);
 CREATE INDEX IF NOT EXISTS idx_responses_status ON responses (status);
+CREATE INDEX IF NOT EXISTS idx_responses_recordia_hash ON responses (recordia_hash) WHERE recordia_hash IS NOT NULL;

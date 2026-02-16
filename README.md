@@ -72,3 +72,52 @@ Cada respuesta del LLM incluye un campo **`status`** que indica su completitud:
 - Filtra "Mostrar solo completos" para limitar historial a respuestas confiables
 - Botón "Exportar solo completos" genera JSONL limpio sin respuestas parciales
 - Indicadores visuales (✅⚠️❌) en cada mensaje del historial
+
+## Integración Recordia (Trazabilidad Forense)
+
+**Cada interacción tiene un hash SHA-256 único** que garantiza integridad y trazabilidad:
+
+### Características
+
+- **Hash automático**: Se genera al guardar cada respuesta
+- **Contenido hasheado**: prompt + response + modelo + latency + status
+- **Inmutable**: Hash único (constraint UNIQUE en BD)
+- **Forense**: Permite verificación de integridad posterior
+
+### Funciones de auditoría
+
+```python
+from db import get_interaction_by_hash, verify_interaction_integrity, get_recordia_audit_log
+
+# Buscar interacción por hash
+interaction = get_interaction_by_hash("e0c2a479e782...")
+# Returns: {prompt_text, response_text, model_used, tenant_name, ...}
+
+# Verificar integridad
+integrity = verify_interaction_integrity(tenant_id=5, response_id=123)
+# Returns: {"is_valid": True, "stored_hash": "...", "calculated_hash": "..."}
+
+# Obtener log de auditoría
+audit_log = get_recordia_audit_log(tenant_id=5, limit=100)
+# Returns: Lista de interacciones con hash Recordia
+```
+
+### Casos de uso
+
+1. **Compliance**: Hash inmutable para auditorías regulatorias
+2. **Dispute resolution**: Verificar qué respondió exactamente el bot
+3. **Data integrity**: Detectar modificaciones no autorizadas
+4. **Forensic analysis**: Búsqueda rápida por hash único
+
+### Verificación manual
+
+```sql
+-- Buscar interacción por hash
+SELECT * FROM responses WHERE recordia_hash = 'hash_aqui';
+
+-- Contar interacciones rastreables por tenant
+SELECT tenant_id, COUNT(*) 
+FROM responses 
+WHERE recordia_hash IS NOT NULL 
+GROUP BY tenant_id;
+```
