@@ -304,6 +304,51 @@ def build_input_with_context(
     return f"Usuario: {user_prompt_text.strip()}\nAsistente:", context_meta
 
 
+def heuristic_context_summary(context_text: str) -> str:
+    """Resumen breve sin IA cuando no hay API key disponible."""
+    lines = [line.strip() for line in context_text.splitlines() if line.strip()]
+    if not lines:
+        return "No hay contexto previo en esta sesión."
+
+    sample = lines[-4:] if len(lines) > 4 else lines
+    joined = " ".join(sample)
+    if len(joined) > 260:
+        joined = joined[:260].rstrip() + "..."
+    return f"Resumen breve (heurístico): {joined}"
+
+
+def generate_ai_context_summary(context_text: str, api_key: str, model_name: str) -> str:
+    """Genera un resumen breve del contexto de conversación usando IA."""
+    if not context_text.strip():
+        return "No hay contexto previo en esta sesión."
+
+    if not api_key:
+        return heuristic_context_summary(context_text)
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        summary_prompt = (
+            "Resume brevemente esta conversación en español. "
+            "Máximo 4 líneas. Incluye: tema principal, objetivo del usuario y estado actual. "
+            "No inventes datos.\n\n"
+            f"CONVERSACIÓN:\n{context_text}"
+        )
+        resp = client.responses.create(
+            model=model_name or "gpt-4o-mini",
+            input=summary_prompt,
+            temperature=0.2,
+        )
+        summary_text = getattr(resp, "output_text", "") or ""
+        summary_text = summary_text.strip()
+        if not summary_text:
+            return "No se pudo generar resumen del contexto en este momento."
+        return summary_text
+    except Exception as exc:
+        return f"No se pudo generar resumen con IA ({exc}). {heuristic_context_summary(context_text)}"
+
+
 if use_context and st.button("👁️ Ver contexto reconstruido"):
     context_text = get_conversation_context_text(
         tenant_id=tenant_id,
@@ -340,6 +385,31 @@ if use_context and st.button("👁️ Ver contexto reconstruido"):
             disabled=True,
             key=f"ctx_preview_{tenant_id}_{session_id}",
         )
+
+if use_context and st.button("🧠 Resumen breve del contexto"):
+    context_text = get_conversation_context_text(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        limit_messages=context_window,
+    )
+
+    if not context_text:
+        st.warning("No hay contexto previo para resumir en esta sesión.")
+    else:
+        context_for_summary = context_text
+        if auto_context_summary:
+            context_for_summary, _ = summarize_long_context(context_text, max_chars=context_max_chars)
+
+        summary = generate_ai_context_summary(
+            context_text=context_for_summary,
+            api_key=api_key,
+            model_name="gpt-4o-mini",
+        )
+        st.session_state[f"context_summary_{tenant_id}_{session_id}"] = summary
+
+summary_key = f"context_summary_{tenant_id}_{session_id}"
+if summary_key in st.session_state and st.session_state[summary_key]:
+    st.info(f"📌 Contexto breve de la conversación:\n\n{st.session_state[summary_key]}")
 
 if st.button("➤ Enviar / Guardar turno"):
     # Guardar system si viene
