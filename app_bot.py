@@ -123,6 +123,8 @@ reasoning_effort = st.sidebar.select_slider(
 )
 use_context = st.sidebar.checkbox("Usar contexto histórico", value=True)
 context_window = st.sidebar.slider("Mensajes de contexto", min_value=4, max_value=80, value=24, step=4)
+auto_context_summary = st.sidebar.checkbox("Resumir contexto largo automáticamente", value=True)
+context_max_chars = st.sidebar.slider("Máximo caracteres de contexto", min_value=1500, max_value=20000, value=7000, step=500)
 
 # Información contextual en la sidebar
 if not api_key:
@@ -221,12 +223,80 @@ def get_conversation_context_text(tenant_id: int, session_id: int, limit_message
     return "\n".join(lines)
 
 
-def build_input_with_context(tenant_id: int, session_id: int, user_prompt_text: str, limit_messages: int = 24) -> str:
+def summarize_long_context(context_text: str, max_chars: int = 7000):
+    """
+    Resume contexto largo sin llamadas extra al modelo.
+    Mantiene encabezado + cola reciente y agrega resumen estructural.
+    """
+    safe_max_chars = max(1200, int(max_chars))
+    if len(context_text) <= safe_max_chars:
+        return context_text, {
+            "compressed": False,
+            "original_chars": len(context_text),
+            "final_chars": len(context_text),
+            "truncated_chars": 0,
+        }
+
+    lines = [line for line in context_text.splitlines() if line.strip()]
+    user_turns = sum(1 for line in lines if line.startswith("Usuario:"))
+    assistant_turns = sum(1 for line in lines if line.startswith("Asistente:"))
+    system_turns = sum(1 for line in lines if line.startswith("Sistema:"))
+
+    summary_header = (
+        "[RESUMEN AUTOMÁTICO DE CONTEXTO]\n"
+        f"- Turnos usuario: {user_turns}\n"
+        f"- Turnos asistente: {assistant_turns}\n"
+        f"- Turnos sistema: {system_turns}\n"
+        "- Se omite parte intermedia para controlar longitud del prompt.\n\n"
+    )
+
+    budget = safe_max_chars - len(summary_header)
+    if budget < 600:
+        budget = 600
+
+    head_size = int(budget * 0.30)
+    tail_size = int(budget * 0.70)
+
+    head = context_text[:head_size].strip()
+    tail = context_text[-tail_size:].strip()
+    reduced = f"{summary_header}[INICIO]\n{head}\n\n[... CONTEXTO INTERMEDIO OMITIDO ...]\n\n[RECIENTE]\n{tail}"
+    reduced = reduced[:safe_max_chars]
+
+    return reduced, {
+        "compressed": True,
+        "original_chars": len(context_text),
+        "final_chars": len(reduced),
+        "truncated_chars": len(context_text) - len(reduced),
+    }
+
+
+def build_input_with_context(
+    tenant_id: int,
+    session_id: int,
+    user_prompt_text: str,
+    limit_messages: int = 24,
+    auto_summary: bool = True,
+    max_context_chars: int = 7000,
+):
     """Construye input final para el modelo incluyendo historial + nuevo turno."""
     context = get_conversation_context_text(tenant_id=tenant_id, session_id=session_id, limit_messages=limit_messages)
+    context_meta = {
+        "compressed": False,
+        "original_chars": len(context),
+        "final_chars": len(context),
+        "truncated_chars": 0,
+        "used": bool(context),
+    }
+
+    if context and auto_summary:
+        context, compact_meta = summarize_long_context(context, max_chars=max_context_chars)
+        context_meta.update(compact_meta)
+    elif context:
+        context_meta["final_chars"] = len(context)
+
     if context:
-        return f"{context}\nUsuario: {user_prompt_text.strip()}\nAsistente:"
-    return f"Usuario: {user_prompt_text.strip()}\nAsistente:"
+        return f"{context}\nUsuario: {user_prompt_text.strip()}\nAsistente:", context_meta
+    return f"Usuario: {user_prompt_text.strip()}\nAsistente:", context_meta
 
 if st.button("➤ Enviar / Guardar turno"):
     # Guardar system si viene
@@ -248,13 +318,28 @@ if st.button("➤ Enviar / Guardar turno"):
                 from openai import OpenAI
                 client = OpenAI(api_key=api_key)
 
+                context_meta = {
+                    "used": False,
+                    "compressed": False,
+                    "original_chars": 0,
+                    "final_chars": 0,
+                    "truncated_chars": 0,
+                }
+
                 if use_context:
-                    full_input = build_input_with_context(
+                    full_input, context_meta = build_input_with_context(
                         tenant_id=tenant_id,
                         session_id=session_id,
                         user_prompt_text=text_to_send,
                         limit_messages=context_window,
+                        auto_summary=auto_context_summary,
+                        max_context_chars=context_max_chars,
                     )
+                    if context_meta.get("compressed"):
+                        st.caption(
+                            f"Contexto comprimido automáticamente: "
+                            f"{context_meta.get('original_chars', 0)} → {context_meta.get('final_chars', 0)} chars"
+                        )
                 else:
                     full_input = build_input(sys_role, text_to_send)
                 req_kwargs = {
@@ -336,7 +421,11 @@ if st.button("➤ Enviar / Guardar turno"):
                         "latency_ms": latency_ms,
                         "finish_reason": finish_reason,
                         "is_complete": is_complete,
-                        "streamed": True
+                        "streamed": True,
+                        "context_used": context_meta.get("used", False),
+                        "context_compressed": context_meta.get("compressed", False),
+                        "context_original_chars": context_meta.get("original_chars", 0),
+                        "context_final_chars": context_meta.get("final_chars", 0),
                     }
                     if error_occurred:
                         metadata["error"] = error_message
