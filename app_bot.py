@@ -303,6 +303,44 @@ def build_input_with_context(
         return f"{context}\nUsuario: {user_prompt_text.strip()}\nAsistente:", context_meta
     return f"Usuario: {user_prompt_text.strip()}\nAsistente:", context_meta
 
+
+if use_context and st.button("👁️ Ver contexto reconstruido"):
+    context_text = get_conversation_context_text(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        limit_messages=context_window,
+    )
+
+    if not context_text:
+        st.warning("No hay contexto previo en esta sesión todavía.")
+    else:
+        context_meta = {
+            "compressed": False,
+            "original_chars": len(context_text),
+            "final_chars": len(context_text),
+            "truncated_chars": 0,
+        }
+
+        if auto_context_summary:
+            context_text, compact_meta = summarize_long_context(context_text, max_chars=context_max_chars)
+            context_meta.update(compact_meta)
+
+        if context_meta.get("compressed"):
+            st.info(
+                f"Contexto reconstruido (comprimido): "
+                f"{context_meta.get('original_chars', 0)} → {context_meta.get('final_chars', 0)} chars"
+            )
+        else:
+            st.info(f"Contexto reconstruido: {context_meta.get('final_chars', 0)} chars")
+
+        st.text_area(
+            "Contexto que se enviará al modelo",
+            value=context_text,
+            height=260,
+            disabled=True,
+            key=f"ctx_preview_{tenant_id}_{session_id}",
+        )
+
 if st.button("➤ Enviar / Guardar turno"):
     # Guardar system si viene
     if sys_role.strip():
