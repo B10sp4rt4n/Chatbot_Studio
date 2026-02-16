@@ -286,6 +286,7 @@ def build_input_with_context(
         "final_chars": len(context),
         "truncated_chars": 0,
         "used": bool(context),
+        "preview": "",
     }
 
     if context and auto_summary:
@@ -293,6 +294,10 @@ def build_input_with_context(
         context_meta.update(compact_meta)
     elif context:
         context_meta["final_chars"] = len(context)
+
+    if context:
+        preview_size = 1200
+        context_meta["preview"] = context[:preview_size]
 
     if context:
         return f"{context}\nUsuario: {user_prompt_text.strip()}\nAsistente:", context_meta
@@ -335,11 +340,28 @@ if st.button("➤ Enviar / Guardar turno"):
                         auto_summary=auto_context_summary,
                         max_context_chars=context_max_chars,
                     )
-                    if context_meta.get("compressed"):
-                        st.caption(
-                            f"Contexto comprimido automáticamente: "
-                            f"{context_meta.get('original_chars', 0)} → {context_meta.get('final_chars', 0)} chars"
-                        )
+                    if context_meta.get("used"):
+                        if context_meta.get("compressed"):
+                            st.info(
+                                f"Contexto aplicado (comprimido): "
+                                f"{context_meta.get('original_chars', 0)} → {context_meta.get('final_chars', 0)} chars"
+                            )
+                        else:
+                            st.info(
+                                f"Contexto aplicado (sin compresión): "
+                                f"{context_meta.get('final_chars', 0)} chars"
+                            )
+
+                        with st.expander("Ver contexto enviado al modelo"):
+                            preview = context_meta.get("preview", "")
+                            if preview:
+                                st.text(preview)
+                                if context_meta.get("final_chars", 0) > len(preview):
+                                    st.caption("Vista previa parcial del contexto.")
+                            else:
+                                st.caption("No hay contexto previo para esta sesión.")
+                    else:
+                        st.warning("No se encontró historial previo; se envía solo el prompt actual.")
                 else:
                     full_input = build_input(sys_role, text_to_send)
                 req_kwargs = {
