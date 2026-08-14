@@ -2,6 +2,58 @@
 
 Chatbot Studio con soporte multitenant sobre Neon PostgreSQL.
 
+## Governance Event Contract v0.1
+
+La rama de gobierno incorpora un núcleo append-only independiente de la UI existente. Cada paso de la interacción produce un evento con identidad, estampa temporal, secuencia por tenant y hashes SHA-256 encadenados.
+
+Componentes nuevos:
+
+- `chatbot_studio/contracts`: modelos del evento canónico.
+- `chatbot_studio/recordia`: canonicalización, sellado y verificación.
+- `chatbot_studio/stores`: EventStore SQLite para desarrollo y pruebas.
+- `chatbot_studio/api`: API FastAPI v0.1.
+- `chatbot_studio/projections.py`: reconstrucción del paquete de interacción.
+- `schemas/interaction-event-v0.1.schema.json`: JSON Schema interoperable.
+- `docs/event-contract-v0.1.md`: reglas semánticas y temporales.
+
+La preservación HotVault se registra como un nuevo evento `EVIDENCE_VAULTED`; no modifica el registro Recordia ya sellado.
+
+### Ejecutar pruebas del contrato
+
+```bash
+python -m unittest discover -v
+```
+
+### Generar ejemplos con hashes reales
+
+```bash
+python -m examples.v0_1.build_examples
+```
+
+### Levantar la API v0.1
+
+```bash
+pip install -r requirements-dev.txt
+uvicorn chatbot_studio.api.app:app --host 0.0.0.0 --port 8000
+```
+
+El EventStore usa `chatbot_studio_events.sqlite3` por defecto. Puede cambiarse con:
+
+```bash
+export CHATBOT_STUDIO_EVENT_DB="/ruta/segura/events.sqlite3"
+```
+
+> La API v0.1 es para desarrollo local. Aún no autentica al llamador: no debe exponerse como servicio multitenant hasta incorporar identidad y derivar el tenant de esa identidad.
+
+Endpoints iniciales:
+
+- `POST /v1/events`
+- `GET /v1/events/{event_id}?tenant_id=...`
+- `GET /v1/interactions/{interaction_id}?tenant_id=...`
+- `GET /v1/users/{user_id}/usage?tenant_id=...`
+- `GET /v1/tenants/{tenant_id}/metrics`
+- `POST /v1/tenants/{tenant_id}/verify-chain`
+
 ## Requisitos
 
 - Python 3.11+

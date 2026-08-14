@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chatbot-studio.local/schemas/interaction-event-v0.1.schema.json",
+  "title": "Chatbot Studio Governance Event v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "tenant_id",
+    "user_id",
+    "session_id",
+    "interaction_id",
+    "occurred_at",
+    "actor",
+    "payload",
+    "sequence_no",
+    "recorded_at",
+    "previous_hash",
+    "payload_hash",
+    "record_hash",
+    "hash_algorithm",
+    "canonicalization"
+  ],
+  "properties": {
+    "schema_version": { "const": "chatbot-studio.event.v0.1" },
+    "event_id": { "type": "string", "minLength": 8, "maxLength": 96 },
+    "event_type": {
+      "enum": [
+        "INTERACTION_RECEIVED",
+        "IDENTITY_VERIFIED",
+        "CONTENT_INSPECTED",
+        "POLICY_DECIDED",
+        "AWARENESS_PRESENTED",
+        "USER_ACKNOWLEDGED",
+        "REVIEW_APPROVED",
+        "REVIEW_REJECTED",
+        "PROVIDER_REQUESTED",
+        "PROVIDER_RESPONDED",
+        "INTERACTION_RECORDED",
+        "EVIDENCE_VAULTED"
+      ]
+    },
+    "tenant_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "user_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "interaction_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_type", "actor_id"],
+      "properties": {
+        "actor_type": { "enum": ["user", "system", "service", "approver"] },
+        "actor_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "role": { "type": ["string", "null"], "maxLength": 160 }
+      }
+    },
+    "payload": { "type": "object" },
+    "sequence_no": { "type": "integer", "minimum": 1 },
+    "previous_hash": {
+      "oneOf": [
+        { "const": "GENESIS" },
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      ]
+    },
+    "payload_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "record_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "hash_algorithm": { "const": "SHA-256" },
+    "canonicalization": { "const": "CS-CANONICAL-JSON-v1" }
+  }
+}
